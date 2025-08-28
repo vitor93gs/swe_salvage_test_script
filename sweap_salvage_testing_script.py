@@ -208,21 +208,29 @@ def ensure_swe_image(_swe_branch=None) -> None:
 
 
 def create_swe_config(config_path: Path) -> None:
-    # Valid for SWE-agent 1.1.0 "run" schema
+    # SWE-agent 1.x RunSingleConfig-compatible config
     config_content = """
 agent:
   tools:
     enable_bash_tool: true
+    parse_function:
+      # gemini doesn't support function calling -> use thought_action
+      type: thought_action
 
 env:
   repo:
     path: /repo
+  deployment:
+    type: docker
+    image: python:3.11
+    # Avoid building a standalone Python image via SWE-ReX
+    python_standalone_dir: null
 
 problem_statement:
-  path: /repo/issue.txt
+  type: text_file
+  path: /cfg/issue.txt
 """
-    config_path.write_text(config_content.strip())
-
+    config_path.write_text(config_content.strip() + "\n", encoding="utf-8")
 
 def run_swe_agent_in_dedicated_container(
     volume_name: str,
@@ -240,203 +248,204 @@ def run_swe_agent_in_dedicated_container(
     log(f"Issue description length: {len(issue_desc)} chars")
     log(f"Timeout set to: {timeout_seconds}s")
 
-    # 1) Write the problem statement and config to the volume
+    # ----- 1) Prepare helper files in a temp dir (mounted later at /cfg) -----
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Issue description
-        prompt_path_host = Path(tmpdir) / "issue.json"
-        prompt_path_host.write_text(json.dumps({"issue_description": issue_desc}, ensure_ascii=False, indent=2))
+        cfg_dir = Path(tmpdir)
+        (cfg_dir / "issue.json").write_text(
+            json.dumps({"issue_description": issue_desc}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        create_swe_config(cfg_dir / "swe_config.yaml")
+        log("Prepared /cfg files (issue.json, swe_config.yaml)")
 
-        # Custom SWE-agent config to fix the hanging issue
-        config_path_host = Path(tmpdir) / "swe_config.yaml"
-        create_swe_config(config_path_host)
-
-        # Copy both files to volume (as root to avoid permission issues)
+        # ----- 2) Pre-clean the repo in the named volume (and mark safe) -----
+        # Guard against non-git dirs & ownership issues; keep quiet if there's nothing to do.
         run_argv([
             "docker", "run", "--rm",
             "-v", f"{volume_name}:/repo",
-            "-v", f"{tmpdir}:/tmp_host",
-            "busybox", "sh", "-lc",
-            "cp /tmp_host/issue.json /repo/issue.json && cp /tmp_host/swe_config.yaml /repo/swe_config.yaml"
-        ])
-        log("Issue description and config written to volume")
+            SWE_IMAGE, "bash", "-lc",
+            (
+                "set -euo pipefail; cd /repo; "
+                "git config --global --add safe.directory /repo || true; "
+                "if [ -d .git ]; then "
+                "  git config core.filemode false || true; "
+                "  git reset --hard HEAD >/dev/null 2>&1 || true; "
+                "  git clean -fd >/dev/null 2>&1 || true; "
+                "  git status --porcelain || true; "
+                "else "
+                "  echo 'No .git directory in /repo; skipping git clean.'; "
+                "fi"
+            ),
+        ], check=False)
 
-    # 2) Build env flags
-    env_flags: List[str] = []
-    api_keys_found = []
-    for k, v in env_keys.items():
-        if v:
-            env_flags += ["-e", k]
-            api_keys_found.append(k)
+        # ----- 3) Build env flags -----
+        env_flags: List[str] = []
+        api_keys_found = []
+        for k, v in env_keys.items():
+            if v:
+                env_flags += ["-e", k]  # pass through from host
+                api_keys_found.append(k)
+        log(f"API keys detected: {api_keys_found}")
 
-    log(f"API keys detected: {api_keys_found}")
+        if env_file:
+            env_flags += ["--env-file", env_file]
 
-    if env_file:
-        env_flags += ["--env-file", env_file]
+        if model_name:
+            env_flags += ["-e", f"MODEL_NAME={model_name}"]
+            log(f"Using explicit model: {model_name}")
 
-    if model_name:
-        env_flags += ["-e", f"MODEL_NAME={model_name}"]
-        log(f"Using explicit model: {model_name}")
+        # ----- 4) Docker socket setup (so SWE-ReX can start runtimes) -----
+        docker_host = os.environ.get("DOCKER_HOST", "")
+        if docker_host:
+            env_flags += ["-e", "DOCKER_HOST"]
 
-    # 3) Docker socket setup
-    docker_host = os.environ.get("DOCKER_HOST", "")
-    if docker_host:
-        env_flags += ["-e", "DOCKER_HOST"]
+        socket_mounts: List[str] = []
+        if docker_host.startswith("unix://"):
+            host_sock = docker_host.replace("unix://", "")
+            if os.path.exists(host_sock):
+                socket_mounts.append(f"{host_sock}:{host_sock}")
+        else:
+            if os.path.exists("/var/run/docker.sock"):
+                socket_mounts.append("/var/run/docker.sock:/var/run/docker.sock")
 
-    socket_mounts: List[str] = []
-    if docker_host.startswith("unix://"):
-        host_sock = docker_host.replace("unix://", "")
-        if os.path.exists(host_sock):
-            socket_mounts.append(f"{host_sock}:{host_sock}")
-    else:
-        if os.path.exists("/var/run/docker.sock"):
-            socket_mounts.append("/var/run/docker.sock:/var/run/docker.sock")
+        user_opt: List[str] = []
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+            if docker_host.startswith("unix://") and f"/run/user/{uid}/docker.sock" in docker_host:
+                user_opt = ["--user", f"{uid}:{gid}"]
+                if os.environ.get("XDG_RUNTIME_DIR"):
+                    env_flags += ["-e", "XDG_RUNTIME_DIR"]
+        except Exception:
+            pass
 
-    user_opt: List[str] = []
-    try:
-        uid = os.getuid()
-        gid = os.getgid()
-        if docker_host.startswith("unix://") and f"/run/user/{uid}/docker.sock" in docker_host:
-            user_opt = ["--user", f"{uid}:{gid}"]
-            if os.environ.get("XDG_RUNTIME_DIR"):
-                env_flags += ["-e", "XDG_RUNTIME_DIR"]
-    except Exception:
-        pass
+        # ----- 5) Launcher script (writes /cfg/issue.txt; uses /cfg config) -----
+        swe_cmd = textwrap.dedent("""
+            set -euo pipefail
+            export PATH="$PATH:/usr/local/bin:~/.local/bin"
 
-    # 4) Fixed SWE-agent launcher script
-    swe_cmd = textwrap.dedent(f"""
-        set -euo pipefail
-        export PATH="$PATH:/usr/local/bin:~/.local/bin"
+            progress() {
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+            }
 
-        progress() {{
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-        }}
+            progress "Starting SWE-agent with fixed configuration"
+            cd /repo
 
-        progress "Starting SWE-agent with fixed configuration"
-        cd /repo
+            # Git: avoid 'dubious ownership'
+            git config --global --add safe.directory /repo || true
+            git config --global user.email "sweagent@example.com" || true
+            git config --global user.name "SWE Agent" || true
 
-        # Git setup
-        git config --global --add safe.directory /repo || true
-        git config --global user.email "sweagent@example.com" || true
-        git config --global user.name "SWE Agent" || true
+            # Detect CLI
+            if command -v sweagent >/dev/null 2>&1; then
+                SA_CMD="sweagent"
+            elif python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('sweagent') else 1)" >/dev/null 2>&1; then
+                SA_CMD="python -m sweagent"
+            else
+                echo "ERROR: sweagent not found" >&2
+                exit 127
+            fi
+            progress "Found SWE-agent: $SA_CMD"
 
-        # Detect CLI
-        if command -v sweagent >/dev/null 2>&1; then
-            SA_CMD="sweagent"
-        elif python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('sweagent') else 1)" >/dev/null 2>&1; then
-            SA_CMD="python -m sweagent"
-        else
-            echo "ERROR: sweagent not found" >&2
-            exit 127
-        fi
+            # Docker check
+            if ! timeout 30 docker version >/dev/null 2>&1; then
+                echo "ERROR: Docker not accessible" >&2
+                exit 127
+            fi
+            progress "Docker verified"
 
-        progress "Found SWE-agent: $SA_CMD"
-
-        # Docker check
-        if ! timeout 30 docker version >/dev/null 2>&1; then
-            echo "ERROR: Docker not accessible" >&2
-            exit 127
-        fi
-
-        progress "Docker verified"
-
-        # Convert issue to text
-        python - <<'PY'
+            # Convert issue JSON -> text file where config expects it
+            python - <<'PY'
 import json
 from pathlib import Path
-try:
-    j = json.loads(Path("issue.json").read_text(encoding="utf-8"))
-    txt = j.get("issue_description") or j.get("description") or ""
-    Path("issue.txt").write_text(txt, encoding="utf-8")
-    print(f"Converted issue to text ({{len(txt)}} chars)")
-except Exception as e:
-    print(f"Error processing issue: {{e}}")
-    raise
+j = json.loads(Path("/cfg/issue.json").read_text(encoding="utf-8"))
+txt = j.get("issue_description") or j.get("description") or ""
+Path("/cfg/issue.txt").write_text(txt, encoding="utf-8")
+print(f"Converted issue to text ({len(txt)} chars) -> /cfg/issue.txt")
 PY
 
-        # Model selection
-        if [ -n "${{MODEL_NAME-}}" ]; then
-            MODEL_NAME="$MODEL_NAME"
-        elif [ -n "${{GOOGLE_API_KEY-}}" ] || [ -n "${{GOOGLE_AI_API_KEY-}}" ] || [ -n "${{GEMINI_API_KEY-}}" ]; then
-            MODEL_NAME="gemini-1.5-pro-latest"
-        elif [ -n "${{OPENAI_API_KEY-}}" ]; then
-            MODEL_NAME="gpt-4o"
-        elif [ -n "${{ANTHROPIC_API_KEY-}}" ]; then
-            MODEL_NAME="claude-3-5-sonnet-20241022"
-        else
-            MODEL_NAME="gemini-1.5-pro-latest"
-        fi
+            # Model selection
+            if [ -n "${MODEL_NAME-}" ]; then
+                MODEL_NAME="$MODEL_NAME"
+            elif [ -n "${GOOGLE_API_KEY-}" ] || [ -n "${GOOGLE_AI_API_KEY-}" ] || [ -n "${GEMINI_API_KEY-}" ]; then
+                MODEL_NAME="gemini-1.5-pro-latest"
+            elif [ -n "${OPENAI_API_KEY-}" ]; then
+                MODEL_NAME="gpt-4o"
+            elif [ -n "${ANTHROPIC_API_KEY-}" ]; then
+                MODEL_NAME="claude-3-5-sonnet-20241022"
+            else
+                MODEL_NAME="gemini-1.5-pro-latest"
+            fi
+            progress "Using model: $MODEL_NAME"
+            progress "Starting SWE-agent run..."
 
-        progress "Using model: $MODEL_NAME"
-        progress "Starting SWE-agent run..."
+            # Run with config & force parser type (Gemini lacks function calling)
+            "$SA_CMD" run \
+              --config="/cfg/swe_config.yaml" \
+              --agent.model.name="$MODEL_NAME" \
+              --agent.tools.parse_function.type=thought_action || {
+                echo "SWE-agent failed with exit code: $?"
+                exit 1
+              }
 
-        # Run with custom config that fixes the hanging issue (use --config)
-       "$SA_CMD" run \
-        --config="/repo/swe_config.yaml" \
-        --agent.model.name="$MODEL_NAME" || {{
-        echo "SWE-agent failed with exit code: $?"
-        exit 1
-        }}
+            progress "SWE-agent completed successfully"
+        """).strip()
 
+        # ----- 6) Launch runner container (host net + mounts + sockets + env) -----
+        mount_args = sum([["-v", m] for m in socket_mounts], [])
+        network_args = ["--network", "host"]  # critical so the agent can hit localhost:<port>
 
-        progress "SWE-agent completed successfully"
-    """).strip()
+        cmd = (
+            ["docker", "run", "--rm", "-t"]
+            + user_opt
+            + network_args
+            + ["-v", f"{volume_name}:/repo"]
+            + ["-v", f"{cfg_dir}:/cfg"]          # mount helper files
+            + mount_args
+            + env_flags
+            + ["-e", "PYTHONUNBUFFERED=1"]
+            + [SWE_IMAGE, "bash", "-lc", swe_cmd]
+        )
 
-    # 5) Run the container with timeout
-    mount_args = sum([["-v", m] for m in socket_mounts], [])
+        log("Starting SWE-agent runner container...")
 
-    # force host networking so localhost inside this container == host
-    network_args = ["--network", "host"]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
 
-    cmd = (
-        ["docker", "run", "--rm", "-t"] + user_opt +
-        network_args +
-        ["-v", f"{volume_name}:/repo"] +
-        mount_args +
-        env_flags +
-        ["-e", "PYTHONUNBUFFERED=1"] +
-        [SWE_IMAGE, "bash", "-lc", swe_cmd]
-    )
-
-    log(f"Starting SWE-agent runner container...")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
-    )
-
-    with log_path.open("w", encoding="utf-8") as lf:
-        try:
-            start_time = time.time()
-            for line in iter(proc.stdout.readline, ""):
-                current_time = time.time()
-                elapsed = current_time - start_time
-                print(line, end="")
-                lf.write(line)
-                lf.flush()
-                if timeout_seconds > 0 and elapsed > timeout_seconds:
-                    log(f"Timeout reached ({timeout_seconds}s), terminating...")
+        with log_path.open("w", encoding="utf-8") as lf:
+            try:
+                start_time = time.time()
+                for line in iter(proc.stdout.readline, ""):
+                    elapsed = time.time() - start_time
+                    print(line, end="")
+                    lf.write(line)
+                    lf.flush()
+                    if timeout_seconds > 0 and elapsed > timeout_seconds:
+                        log(f"Timeout reached ({timeout_seconds}s), terminating...")
+                        proc.terminate()
+                        time.sleep(5)
+                        if proc.poll() is None:
+                            proc.kill()
+                        break
+            except Exception as e:
+                log(f"Error during execution: {e}")
+            finally:
+                if proc.poll() is None:
                     proc.terminate()
-                    time.sleep(5)
-                    if proc.poll() is None:
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
                         proc.kill()
-                    break
-        except Exception as e:
-            log(f"Error during execution: {e}")
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                        proc.wait()
 
-    if proc.returncode != 0:
-        log(f"SWE-agent exited with code {proc.returncode}. See {log_path.name}.")
-    else:
-        log(f"SWE-agent completed successfully. See {log_path.name}.")
+        if proc.returncode != 0:
+            log(f"SWE-agent exited with code {proc.returncode}. See {log_path.name}.")
+        else:
+            log(f"SWE-agent completed successfully. See {log_path.name}.")
 
 
 def _force_remove_containers_using_volume(vol: str):

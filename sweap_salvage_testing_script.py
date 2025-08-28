@@ -25,7 +25,6 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-import threading
 
 import pandas as pd
 
@@ -206,15 +205,29 @@ def ensure_swe_image(_swe_branch=None) -> None:
         Path(tmpdir, "Dockerfile").write_text(dockerfile_swe)
         run_capture_argv(["docker", "build", "-t", SWE_IMAGE, "."], cwd=Path(tmpdir), check=True)
 
-
 def create_swe_config(config_path: Path) -> None:
-    # SWE-agent 1.x RunSingleConfig-compatible config
+    # SWE-agent 1.x run config with explicit templates so the LM gets non-empty input
     config_content = """
 agent:
+  templates:
+    system_template: |-
+      You are an autonomous software engineer working in a constrained terminal.
+      Always reason step-by-step, then issue a single bash command in a fenced block.
+      When you believe the issue has been fixed output a final message
+      and STOP. Do not continue exploring after completion.
+      Avoid interactive programs. Prefer small, targeted edits.
+    instance_template: |-
+      You are working in this repository to address the following issue.
+      <ISSUE>
+      {{ problem_statement }}
+      </ISSUE>
+      Definition of Done:
+      - The code change addresses the issue.
+      If these conditions are met, say you are done and stop issuing further commands.
+
   tools:
     enable_bash_tool: true
     parse_function:
-      # gemini doesn't support function calling -> use thought_action
       type: thought_action
 
 env:
@@ -223,7 +236,6 @@ env:
   deployment:
     type: docker
     image: python:3.11
-    # Avoid building a standalone Python image via SWE-ReX
     python_standalone_dir: null
 
 problem_statement:

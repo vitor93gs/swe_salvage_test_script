@@ -107,7 +107,7 @@ Make sure the files are **shared** (Anyone with the link can view/download) or y
 ## Environment Variables
 
 
-SWE-agent needs at least one of these set **on the host** (they’re passed into the container when running SWE-agent):
+SWE-agent needs at least one of the API keys set **on the host**, either in an env file that can be passed as a flag in the CLI call, or exported like this (they’re passed into the container when running SWE-agent):
 
 ```bash
 export OPENAI_API_KEY=sk-...           # for OpenAI models
@@ -117,7 +117,7 @@ export GOOGLE_AI_API_KEY=...           # for Gemini models (preferred)
 export GEMINI_API_KEY=...              # for Gemini models (alternative)
 ```
 
-The script will auto-detect which key is present and select the appropriate model (gpt-4o, claude-3-5-sonnet, or gemini-1.5-pro-latest).
+The script will auto-detect which key is present and select the appropriate model (gpt-4o, claude-3-5-sonnet, or gemini-1.5-pro-latest) if no model is selected using the --model flag.
 
 ---
 

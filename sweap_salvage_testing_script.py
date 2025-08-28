@@ -384,8 +384,12 @@ PY
     # 5) Run the container with timeout
     mount_args = sum([["-v", m] for m in socket_mounts], [])
 
+    # force host networking so localhost inside this container == host
+    network_args = ["--network", "host"]
+
     cmd = (
         ["docker", "run", "--rm", "-t"] + user_opt +
+        network_args +
         ["-v", f"{volume_name}:/repo"] +
         mount_args +
         env_flags +

@@ -212,10 +212,12 @@ agent:
   templates:
     system_template: |-
       You are an autonomous software engineer working in a constrained terminal.
-      Always reason step-by-step, then issue a single bash command in a fenced block.
-      When you believe the issue has been fixed output a final message
-      and STOP. Do not continue exploring after completion.
+      Always reason step-by-step. Start by searching the codebase to understand the current state of the project then proceed to evaluate, propose and implement the changes needed.
       Avoid interactive programs. Prefer small, targeted edits.
+      When the Definition of Done is satisfied:
+      - First run: submit
+      - If the tool asks to confirm or shows a review stage, then run: submit -f
+      Do not pass any message to submit. Stop after submission.
     instance_template: |-
       You are working in this repository to address the following issue.
       <ISSUE>
@@ -223,12 +225,16 @@ agent:
       </ISSUE>
       Definition of Done:
       - The code change addresses the issue.
-      If these conditions are met, say you are done and stop issuing further commands.
+      If these conditions are met, run `submit`. If asked to confirm, run `submit -f`. Then stop.
 
   tools:
     enable_bash_tool: true
+    submit_command: submit    
     parse_function:
       type: thought_action
+    bundles:
+      - path: tools/registry
+      - path: tools/review_on_submit_m
 
 env:
   repo:

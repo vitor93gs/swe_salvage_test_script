@@ -28,9 +28,10 @@ from typing import Dict, Any, Optional, List
 
 import pandas as pd
 
-# ------------- config you can tweak -------------
+# ------------- config  -------------------------
 BUILD_ARGS: List[str] = []
-BASE_OUT = Path("tasks_runs").absolute()
+BASE_OUT = Path("tasks").absolute()
+TEST_LOGS_DIR = BASE_OUT / "test_logs"  
 IMAGE_PREFIX = "task-"
 CONTAINER_PREFIX = "container_"
 SWE_IMAGE = "swe-agent-runner:latest"
@@ -513,6 +514,7 @@ def main():
     df = df[df["task_id"].astype(str).str.strip() != ""]
 
     BASE_OUT.mkdir(exist_ok=True)
+    TEST_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     ensure_swe_image(args.swe_branch)
 
     _volatile = {"containers": [], "volumes": []}
@@ -679,28 +681,48 @@ def main():
             log(f"SWE-agent error: {e}")
 
         # Run tests
-        tests_log = task_dir / "tests.log"
+        tests_log = TEST_LOGS_DIR / f"{task_id}.log"
         try:
             proc = run_capture_argv(
                 ["docker", "exec", "-i", container, "bash", "-lc", test_cmd],
-                check=False,
+                check=False,  # do NOT raise on nonzero exit; we only care that they ran
                 timeout=args.test_timeout
             )
             tests_log.write_text(proc.stdout)
-            status = "tests_passed" if proc.returncode == 0 else "tests_failed"
+            # "Ran successfully" means the command executed and returned (even if exit code != 0)
             result = {
                 "task_id": task_id,
-                "status": status,
-                "test_exit_code": proc.returncode
+                "status": "tests_ran",
+                "tests_ran_successfully": True,
+                "tests_exit_code": proc.returncode,
             }
             all_results.append(result)
             (task_dir / "result.json").write_text(json.dumps(result, indent=2))
+
         except subprocess.TimeoutExpired:
-            result = {"task_id": task_id, "status": "tests_timeout"}
+            # Timed out -> did not run to completion; create (or touch) an empty log if none exists
+            if not tests_log.exists():
+                tests_log.write_text("")
+            result = {
+                "task_id": task_id,
+                "status": "tests_timeout",
+                "tests_ran_successfully": False,
+                "tests_exit_code": None,
+            }
             all_results.append(result)
             (task_dir / "result.json").write_text(json.dumps(result, indent=2))
+
         except Exception as e:
-            result = {"task_id": task_id, "status": "tests_error", "error": str(e)}
+            # Exec/infra error -> did not run successfully
+            if not tests_log.exists():
+                tests_log.write_text("")
+            result = {
+                "task_id": task_id,
+                "status": "tests_error",
+                "tests_ran_successfully": False,
+                "tests_exit_code": None,
+                "error": str(e),
+            }
             all_results.append(result)
             (task_dir / "result.json").write_text(json.dumps(result, indent=2))
 

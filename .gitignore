@@ -1,5 +1,5 @@
 .venv
-tasks_runs
+tasks
 files
 api_key.txt
 .env.sweagent

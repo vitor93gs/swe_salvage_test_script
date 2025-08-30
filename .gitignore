@@ -3,3 +3,4 @@ tasks
 files
 api_key.txt
 .env.sweagent
+__pycache__
